@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+*.env
+.vscode/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Flask specific
+instance/
+.flaskenv
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# PDF and image outputs (if not meant to be versioned)
+*.pdf
+*.png
