@@ -20,8 +20,8 @@
             border: 1px solid #a7d9ff;
             padding: 20px;
             margin-bottom: 30px;
-            background-color: #e0f2ff; /* Light blue background */
-            border-left: 6px solid #007bff; /* Blue border on the left */
+            background-color: #e0f2ff;
+            border-left: 6px solid #007bff;
             border-radius: 8px;
         }
         .analysis-box p {
@@ -29,8 +29,16 @@
             font-size: 1.05em;
             line-height: 1.5;
         }
-        .normal { color: #28a745; font-weight: bold; } /* Verde para normal */
-        .abnormal { color: #dc3545; font-weight: bold; } /* Vermelho para anormal */
+        .analysis-box ul {
+            list-style-type: none;
+            padding-left: 0;
+            margin-top: 10px;
+        }
+        .analysis-box ul li {
+            margin-bottom: 8px;
+        }
+        .normal { color: #28a745; font-weight: bold; }
+        .abnormal { color: #dc3545; font-weight: bold; }
         .info-detail { font-size: 0.95em; color: #555; }
 
         img { max-width: 100%; height: auto; display: block; margin-top: 30px; border: 1px solid #ccc; border-radius: 5px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
@@ -40,18 +48,34 @@
             margin-top: 40px;
             font-size: 1.1em;
         }
-        .back-link a {
+        .action-buttons {
+            text-align: center;
+            margin-top: 30px;
+            margin-bottom: 30px;
+        }
+        .action-buttons a {
             color: #007bff;
             text-decoration: none;
-            padding: 10px 20px;
+            padding: 12px 25px;
             border: 1px solid #007bff;
             border-radius: 5px;
             transition: all 0.3s ease;
+            margin: 0 10px;
+            display: inline-block;
         }
-        .back-link a:hover {
+        .action-buttons a:hover {
             background-color: #007bff;
             color: white;
             box-shadow: 0 2px 10px rgba(0,123,255,0.3);
+        }
+        .action-buttons a.pdf-button {
+            background-color: #dc3545; /* Cor vermelha para PDF */
+            color: white;
+            border-color: #dc3545;
+        }
+        .action-buttons a.pdf-button:hover {
+            background-color: #c82333;
+            border-color: #bd2130;
         }
     </style>
 </head>
@@ -69,20 +93,29 @@
             <hr style="border: 0; height: 1px; background: #cce0f0; margin: 15px 0;">
             <p><strong>Conclusão da Análise Simplificada:</strong></p>
             <div>
-                {{ analysis_result | safe }}
+                <p>{{ analysis_result.overall_status_html | safe }}</p>
+                <ul>
+                    <li>{{ analysis_result.frequencia_cardiaca | safe }}</li>
+                    <li>{{ analysis_result.duracao_qrs | safe }}</li>
+                    <li>{{ analysis_result.eixo_qrs | safe }}</li>
+                </ul>
             </div>
+            <p style="font-size: 0.9em; color: #666; margin-top: 10px; border-top: 1px dashed #ccc; padding-top: 10px;">
+                {{ analysis_result.attention_note | safe }}
+            </p>
         </div>
 
-        <h2>Gráfico do ECG Gerado:</h2>
+        <div class="action-buttons">
+            <a href="{{ url_for('generate_pdf') }}" class="pdf-button" target="_blank">Gerar Relatório PDF</a>
+            <a href="/">Analisar Novo ECG</a>
+        </div>
+
+        <h2>Traçado do ECG Gerado:</h2>
         {% if ecg_image %}
             <img src="data:image/png;base64,{{ ecg_image }}" alt="Gráfico de ECG">
         {% else %}
             <p>Não foi possível gerar o gráfico do ECG. Verifique o arquivo XML.</p>
         {% endif %}
-
-        <div class="back-link">
-            <a href="/">&#8592; Voltar para o Upload de um novo ECG</a>
-        </div>
     </div>
 </body>
 </html>

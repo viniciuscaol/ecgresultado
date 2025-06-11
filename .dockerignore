@@ -1,0 +1,28 @@
+# Ignora o diretório do ambiente virtual
+venv/
+env/
+
+# Ignora os arquivos de cache do Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignora o próprio Dockerfile e .dockerignore
+Dockerfile
+.dockerignore
+
+# Ignora o diretório .git e o arquivo .gitignore (metadados de versionamento)
+.git/
+.gitignore
+
+# Ignora logs ou arquivos temporários
+*.log
+*.tmp
+temp/
+tmp/
+
+# Ignora PDFs e PNGs gerados pela aplicação se eles não forem parte da imagem final.
+# Se você *quiser* que eles sejam copiados para a imagem (geralmente não é o caso), remova estas linhas.
+*.pdf
+*.png
