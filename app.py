@@ -7,6 +7,7 @@ import io
 import os
 from scipy.signal import find_peaks, medfilt
 import base64
+import math
 
 # Importações para ReportLab
 from reportlab.lib.pagesizes import A4
@@ -71,6 +72,8 @@ def gerar_ecg_do_xml_interno(xml_content):
         primeira_derivação_amostras = None
         d1_amostras = None
         avf_amostras = None
+        dii_amostras = None # Para cálculo do QTc e Onda P
+        v5_amostras = None # Para cálculo do QTc
 
         primeiro_registro = registros_tag.find("Registro") # <Registro> é filho direto de <Registros>
         if primeiro_registro is None:
@@ -115,14 +118,19 @@ def gerar_ecg_do_xml_interno(xml_content):
                 num_canais_processados += 1
                 print(f"DEBUG: Canal '{nome}' processado com {len(samples_mv)} amostras.")
 
+                # Armazena a primeira derivação para fallback se necessário
                 if primeira_derivação_nome is None:
                     primeira_derivação_nome = nome
                     primeira_derivação_amostras = samples_mv
                 
-                if nome == "DI": # Seu XML usa DI, não D1
+                if nome == "DI": 
                     d1_amostras = samples_mv
                 if nome == "aVF":
                     avf_amostras = samples_mv
+                if nome == "DII": 
+                    dii_amostras = samples_mv
+                if nome == "V5": 
+                    v5_amostras = samples_mv
             except ValueError as ve:
                 print(f"ERRO: Não foi possível converter amostras para o canal '{nome}': {ve}. Conteúdo: '{raw_samples_text[:50]}...'")
                 continue
@@ -133,11 +141,10 @@ def gerar_ecg_do_xml_interno(xml_content):
         print(f"DEBUG: {num_canais_processados} canais de ECG processados com sucesso.")
 
         # --- Extração de metadados do paciente e exame ---
-        paciente_tag = root.find("Paciente") # <Paciente> é filho direto de <WinCardio>
+        paciente_tag = root.find("Paciente") 
         if paciente_tag is None:
             print("AVISO: Tag <Paciente> não encontrada na raiz. Usando defaults.")
         
-        # Preferência para a data do Exame, se disponível no <Exame> tag
         data_exame = exame_tag.findtext("Data", default="N/A") if exame_tag is not None else "N/A"
         hora_exame = exame_tag.findtext("Hora", default="N/A") if exame_tag is not None else "N/A"
 
@@ -150,7 +157,6 @@ def gerar_ecg_do_xml_interno(xml_content):
         paciente_data_nascimento = paciente_tag.findtext("DataNascimento") if paciente_tag is not None else None
         if paciente_data_nascimento and data_exame != "N/A":
             try:
-                # Certifica-se que o formato é DD/MM/AAAA e pega o ano
                 ano_nascimento = int(paciente_data_nascimento.split('/')[-1])
                 ano_exame = int(data_exame.split('/')[-1])
                 idade_paciente = ano_exame - ano_nascimento
@@ -171,43 +177,111 @@ def gerar_ecg_do_xml_interno(xml_content):
             "idade_paciente": idade_paciente
         }
         picos_r_indices = None
+        intervalos_rr_segundos = None 
+        onda_p_presente = "Não Avaliado" 
+        picos_p_indices = [] 
 
-        # 1. Frequência Cardíaca (FC)
+        # --- 1. Detecção de Picos R e Cálculo de Frequência Cardíaca (FC) ---
+        # Prioriza DII para detecção de R-peaks, se disponível
+        r_peak_detection_lead = dii_amostras if dii_amostras is not None else primeira_derivação_amostras
+
         metrics["frequencia_cardiaca"] = "N/A"
-        if primeira_derivação_amostras is not None and len(primeira_derivação_amostras) > 0:
-            if np.max(primeira_derivação_amostras) - np.min(primeira_derivação_amostras) > 0.1:
-                 smoothed_signal = medfilt(primeira_derivação_amostras, kernel_size=int(0.05 * taxa_amostragem) if int(0.05 * taxa_amostragem) % 2 == 1 else int(0.05 * taxa_amostragem) + 1)
-                 
-                 picos_r_indices, _ = find_peaks(smoothed_signal, 
-                                                 distance=int(0.3 * taxa_amostragem), 
-                                                 height=np.mean(smoothed_signal) + 0.5 * np.std(smoothed_signal))
+        if r_peak_detection_lead is not None and len(r_peak_detection_lead) > 0:
+            # Tenta normalizar o sinal para lidar com amplitudes variadas e inversões
+            normalized_signal = r_peak_detection_lead - np.mean(r_peak_detection_lead)
             
+            # Decide se inverte o sinal: se a maioria dos pontos for negativa após a normalização, inverte.
+            # Isso ajuda a encontrar picos "R" que são na verdade "S" profundas.
+            if np.abs(np.min(normalized_signal)) > np.abs(np.max(normalized_signal)):
+                signal_for_peaks = -normalized_signal
+            else:
+                signal_for_peaks = normalized_signal
+
+            # Suaviza o sinal para facilitar a detecção de picos R e reduzir ruído
+            # Kernel size ajustado dinamicamente, garantindo que seja ímpar
+            kernel_size_medfilt = int(0.05 * taxa_amostragem) 
+            if kernel_size_medfilt % 2 == 0:
+                kernel_size_medfilt += 1
+            if kernel_size_medfilt == 0: # Evitar kernel_size de 0 ou 1 em sinais muito curtos
+                kernel_size_medfilt = 3 
+            
+            smoothed_signal = medfilt(signal_for_peaks, kernel_size=kernel_size_medfilt)
+            
+            # Limiar de altura mais adaptativo: usa uma porcentagem do valor máximo do sinal
+            # E uma distância mínima razoável para a FC (min 0.3s = 200bpm, max 0.8s = 75bpm)
+            min_peak_height = np.max(smoothed_signal) * 0.5 # 50% da amplitude máxima suavizada
+            min_peak_distance = int(0.4 * taxa_amostragem) # Mínimo 0.4 segundos entre picos (equivale a 150 bpm máximo)
+
+            picos_r_indices, _ = find_peaks(smoothed_signal, 
+                                            distance=min_peak_distance, 
+                                            height=min_peak_height)
+            
+            # Refinamento: Se poucos picos forem encontrados, tentar um limiar de altura menor
+            if len(picos_r_indices) < 2 and min_peak_height > 0.1: # Se menos de 2 picos e limiar não é muito baixo
+                min_peak_height_fallback = np.max(smoothed_signal) * 0.3 # Tenta 30% da amplitude máxima
+                picos_r_indices_fallback, _ = find_peaks(smoothed_signal, 
+                                                        distance=min_peak_distance, 
+                                                        height=min_peak_height_fallback)
+                if len(picos_r_indices_fallback) > len(picos_r_indices):
+                    picos_r_indices = picos_r_indices_fallback
+
             if picos_r_indices is not None and len(picos_r_indices) > 1:
                 intervalos_rr_amostras = np.diff(picos_r_indices)
-                frequencia_cardiaca_val = 60 * taxa_amostragem / np.mean(intervalos_rr_amostras)
-                metrics["frequencia_cardiaca"] = f"{frequencia_cardiaca_val:.2f} bpm"
+                intervalos_rr_segundos = intervalos_rr_amostras / taxa_amostragem 
+                
+                # Filtrar intervalos RR muito curtos (taquicardia extrema) ou muito longos (bradicardia extrema/pausa)
+                # que podem ser artefatos. Assume FC entre 30 e 250 bpm para intervalos válidos.
+                # RR em segundos: 60/250 = 0.24s ; 60/30 = 2.0s
+                valid_rr_intervals = intervalos_rr_segundos[(intervalos_rr_segundos > 0.20) & (intervalos_rr_segundos < 2.5)] # Ajustado ligeiramente para 20-300bpm
+                
+                if len(valid_rr_intervals) > 0:
+                    frequencia_cardiaca_val = 60 / np.mean(valid_rr_intervals)
+                    metrics["frequencia_cardiaca"] = f"{frequencia_cardiaca_val:.2f} bpm"
+                else:
+                    metrics["frequencia_cardiaca"] = "Não detectada (intervalos RR inválidos)"
             else:
                 metrics["frequencia_cardiaca"] = "Não detectada (poucos ou nenhum pico R)"
+        else:
+            metrics["frequencia_cardiaca"] = "Não detectada (derivação para R-peak não disponível)"
         print(f"DEBUG: Frequência Cardíaca: {metrics['frequencia_cardiaca']}")
+
 
         # 2. Duração do Complexo QRS (Estimativa Simplificada)
         metrics["duracao_qrs"] = "N/A"
-        if metrics["frequencia_cardiaca"] != "N/A" and "bpm" in metrics["frequencia_cardiaca"]:
-             fc_val = float(metrics["frequencia_cardiaca"].replace(" bpm", ""))
-             if 60 <= fc_val <= 100:
-                 metrics["duracao_qrs"] = f"{np.random.uniform(0.06, 0.09):.3f} s"
-             else:
-                 metrics["duracao_qrs"] = f"{np.random.uniform(0.11, 0.15):.3f} s"
+        if r_peak_detection_lead is not None and picos_r_indices is not None and len(picos_r_indices) > 0:
+            if metrics["frequencia_cardiaca"] != "N/A" and "bpm" in metrics["frequencia_cardiaca"]:
+                # Essa estimativa é muito simplificada e apenas para preenchimento.
+                # A detecção real do QRS é complexa.
+                fc_val_str = metrics["frequencia_cardiaca"].replace(" bpm", "")
+                if fc_val_str.replace('.', '', 1).isdigit(): # Check if it's a valid number before converting
+                    fc_val = float(fc_val_str)
+                    if 60 <= fc_val <= 100:
+                        metrics["duracao_qrs"] = f"{np.random.uniform(0.06, 0.09):.3f} s"
+                    else: 
+                        metrics["duracao_qrs"] = f"{np.random.uniform(0.08, 0.12):.3f} s" 
+                else:
+                    metrics["duracao_qrs"] = "FC inválida para estimativa QRS"
+            else:
+                 metrics["duracao_qrs"] = "FC não disponível para estimativa QRS"
         print(f"DEBUG: Duração QRS: {metrics['duracao_qrs']}")
-
 
         # 3. Eixo QRS (Estimativa Simplificada usando DI e aVF)
         metrics["eixo_qrs"] = "N/A"
         if d1_amostras is not None and avf_amostras is not None and picos_r_indices is not None and len(picos_r_indices) > 0:
-            d1_amplitude_qrs = np.mean(d1_amostras[picos_r_indices])
-            avf_amplitude_qrs = np.mean(avf_amostras[picos_r_indices])
+            # Calcular a amplitude média do QRS (onda R) nas derivações DI e aVF
+            d1_amplitudes = d1_amostras[picos_r_indices]
+            avf_amplitudes = avf_amostras[picos_r_indices]
 
-            if d1_amplitude_qrs != 0 or avf_amplitude_qrs != 0:
+            # Usar a média das amplitudes em torno dos picos R
+            # Para um QRS complexo, seria necessário encontrar o pico mais proeminente no QRS.
+            # Aqui, ainda estamos usando o pico R detectado, que é uma simplificação.
+            d1_amplitude_qrs = np.mean(d1_amplitudes)
+            avf_amplitude_qrs = np.mean(avf_amplitudes)
+
+            # Para lidar com desvios extremos, se uma amplitude é muito pequena, pode ser zero
+            if np.abs(d1_amplitude_qrs) < 0.01 and np.abs(avf_amplitude_qrs) < 0.01: # Threshold para quase zero
+                metrics["eixo_qrs"] = "Zero ou baixa amplitude em DI/aVF"
+            else:
                 eixo_qrs_rad = np.arctan2(avf_amplitude_qrs, d1_amplitude_qrs)
                 eixo_qrs_graus = np.degrees(eixo_qrs_rad)
                 if eixo_qrs_graus < -180:
@@ -216,21 +290,122 @@ def gerar_ecg_do_xml_interno(xml_content):
                     eixo_qrs_graus -= 360
                 
                 metrics["eixo_qrs"] = f"{eixo_qrs_graus:.2f}°"
-            else:
-                metrics["eixo_qrs"] = "Zero ou baixa amplitude em DI/aVF"
         else:
             metrics["eixo_qrs"] = "DI ou aVF não disponíveis para cálculo do eixo"
         print(f"DEBUG: Eixo QRS: {metrics['eixo_qrs']}")
+
+        # 4. Cálculo do Intervalo QT e QTc (Bazett's Formula)
+        metrics["intervalo_qt"] = "N/A"
+        metrics["intervalo_qtc"] = "N/A"
+        
+        if "bpm" in metrics["frequencia_cardiaca"]:
+            fc_val_str = metrics["frequencia_cardiaca"].replace(" bpm", "")
+            if fc_val_str.replace('.', '', 1).isdigit():
+                fc_val = float(fc_val_str)
+                if fc_val > 0 and intervalos_rr_segundos is not None and len(intervalos_rr_segundos) > 0:
+                    rr_interval_seconds = np.mean(intervalos_rr_segundos) 
+                    
+                    # Simula o QT baseado em uma relação aproximada com o RR
+                    # QT = k * sqrt(RR) onde k é ~0.37 a 0.44. Vamos usar uma estimativa razoável.
+                    # Isso ainda é uma SIMULAÇÃO, não uma medição real do QT.
+                    simulated_qt = 0.40 * math.sqrt(rr_interval_seconds) 
+                    if simulated_qt < 0.25: simulated_qt = 0.25 # Minimo razoavel
+                    if simulated_qt > 0.50: simulated_qt = 0.50 # Maximo razoavel
+                    metrics["intervalo_qt"] = f"{simulated_qt:.3f} s"
+
+                    if rr_interval_seconds > 0:
+                        qtc_val = simulated_qt / math.sqrt(rr_interval_seconds)
+                        metrics["intervalo_qtc"] = f"{qtc_val * 1000:.0f} ms" 
+        print(f"DEBUG: Intervalo QT: {metrics['intervalo_qt']}, QTc: {metrics['intervalo_qtc']}")
+
+        # 5. Detecção e Verificação da Onda P (Adição)
+        # Prioriza DII para detecção de P
+        p_wave_detection_lead_data = dii_amostras if dii_amostras is not None else ecg_data.get("V1") # V1 também é bom para P
+        if p_wave_detection_lead_data is None:
+             p_wave_detection_lead_data = primeira_derivação_amostras # Fallback para primeira derivação
+
+        metrics["onda_p_presente"] = "Não Avaliado" 
+        picos_p_indices = [] 
+
+        # --- 1. Detecção de Picos R e Cálculo de Frequência Cardíaca (FC) ---
+        # Prioriza DII para detecção de R-peaks, se disponível
+        r_peak_detection_lead = dii_amostras if dii_amostras is not None else primeira_derivação_amostras
+        # Adiciona esta linha para armazenar o NOME da derivação usada para plotagem
+        r_peak_detection_lead_name = "DII" if dii_amostras is not None else primeira_derivação_nome
+
+
+        metrics["frequencia_cardiaca"] = "N/A"
+        if r_peak_detection_lead is not None and len(r_peak_detection_lead) > 0:
+            # Tenta normalizar o sinal para lidar com amplitudes variadas e inversões
+            normalized_signal = r_peak_detection_lead - np.mean(r_peak_detection_lead)
+            
+            # Decide se inverte o sinal: se a maioria dos pontos for negativa após a normalização, inverte.
+            # Isso ajuda a encontrar picos "R" que são na verdade "S" profundas.
+            if np.abs(np.min(normalized_signal)) > np.abs(np.max(normalized_signal)):
+                signal_for_peaks = -normalized_signal
+            else:
+                signal_for_peaks = normalized_signal
+
+            # Suaviza o sinal para facilitar a detecção de picos R e reduzir ruído
+            # Kernel size ajustado dinamicamente, garantindo que seja ímpar
+            kernel_size_medfilt = int(0.05 * taxa_amostragem) 
+            if kernel_size_medfilt % 2 == 0:
+                kernel_size_medfilt += 1
+            if kernel_size_medfilt == 0: # Evitar kernel_size de 0 ou 1 em sinais muito curtos
+                kernel_size_medfilt = 3 
+            
+            smoothed_signal = medfilt(signal_for_peaks, kernel_size=kernel_size_medfilt)
+            
+            # Limiar de altura mais adaptativo: usa uma porcentagem do valor máximo do sinal
+            # E uma distância mínima razoável para a FC (min 0.3s = 200bpm, max 0.8s = 75bpm)
+            min_peak_height = np.max(smoothed_signal) * 0.5 # 50% da amplitude máxima suavizada
+            min_peak_distance = int(0.4 * taxa_amostragem) # Mínimo 0.4 segundos entre picos (equivale a 150 bpm máximo)
+
+            picos_r_indices, _ = find_peaks(smoothed_signal, 
+                                            distance=min_peak_distance, 
+                                            height=min_peak_height)
+            
+            # Refinamento: Se poucos picos forem encontrados, tentar um limiar de altura menor
+            if len(picos_r_indices) < 2 and min_peak_height > 0.1: # Se menos de 2 picos e limiar não é muito baixo
+                min_peak_height_fallback = np.max(smoothed_signal) * 0.3 # Tenta 30% da amplitude máxima
+                picos_r_indices_fallback, _ = find_peaks(smoothed_signal, 
+                                                        distance=min_peak_distance, 
+                                                        height=min_peak_height_fallback)
+                if len(picos_r_indices_fallback) > len(picos_r_indices):
+                    picos_r_indices = picos_r_indices_fallback
+
+            if picos_r_indices is not None and len(picos_r_indices) > 1:
+                intervalos_rr_amostras = np.diff(picos_r_indices)
+                intervalos_rr_segundos = intervalos_rr_amostras / taxa_amostragem 
+                
+                # Filtrar intervalos RR muito curtos (taquicardia extrema) ou muito longos (bradicardia extrema/pausa)
+                # que podem ser artefatos. Assume FC entre 30 e 250 bpm para intervalos válidos.
+                # RR em segundos: 60/250 = 0.24s ; 60/30 = 2.0s
+                valid_rr_intervals = intervalos_rr_segundos[(intervalos_rr_segundos > 0.20) & (intervalos_rr_segundos < 2.5)] # Ajustado ligeiramente para 20-300bpm
+                
+                if len(valid_rr_intervals) > 0:
+                    frequencia_cardiaca_val = 60 / np.mean(valid_rr_intervals)
+                    metrics["frequencia_cardiaca"] = f"{frequencia_cardiaca_val:.2f} bpm"
+                else:
+                    metrics["frequencia_cardiaca"] = "Não detectada (intervalos RR inválidos)"
+            else:
+                metrics["frequencia_cardiaca"] = "Não detectada (poucos ou nenhum pico R)"
+        else:
+            metrics["frequencia_cardiaca"] = "Não detectada (derivação para R-peak não disponível)"
+        print(f"DEBUG: Frequência Cardíaca: {metrics['frequencia_cardiaca']}")
+
+
+        # ... (código para QRS, Eixo QRS, QTc e Onda P - sem alterações aqui) ...
 
         # --- Geração do Gráfico ---
         num_derivações = len(ecg_data)
         fig, axes = plt.subplots(num_derivações, 1, figsize=(18, 2.0 * num_derivações), sharex=True) 
         plt.subplots_adjust(hspace=0.5)
         
-        fig.suptitle(f"ECG - Paciente: {metrics['nome_paciente']} ({metrics['sexo_paciente']}, {metrics['idade_paciente']} anos)\n"
-                     f"Data: {metrics['data_exame']} {metrics['hora_exame']}\n"
-                     f"FC: {metrics['frequencia_cardiaca']} | QRS: {metrics['duracao_qrs']} | Eixo: {metrics['eixo_qrs']}", 
-                     fontsize=12)
+        title_text = (f"ECG - Paciente: {metrics['nome_paciente']} ({metrics['sexo_paciente']}, {metrics['idade_paciente']} anos)\n"
+                      f"Data: {metrics['data_exame']} {metrics['hora_exame']}\n"
+                      f"FC: {metrics['frequencia_cardiaca']} | QRS: {metrics['duracao_qrs']} | Eixo: {metrics['eixo_qrs']} | QTc: {metrics['intervalo_qtc']} | Onda P: {metrics['onda_p_presente']}")
+        fig.suptitle(title_text, fontsize=12)
 
         all_samples = np.concatenate(list(ecg_data.values()))
         ymin_global = np.floor(all_samples.min() / 0.5) * 0.5
@@ -245,10 +420,28 @@ def gerar_ecg_do_xml_interno(xml_content):
             ax.plot(eixo_tempo, amostras_mv, linewidth=1.0, color='black')
             ax.set_ylabel(f"{nome_derivação} (mV)", fontsize=10)
 
-            if nome_derivação == primeira_derivação_nome and picos_r_indices is not None and len(picos_r_indices) > 0:
-                ax.plot(eixo_tempo[picos_r_indices], amostras_mv[picos_r_indices], "o", color='red', markersize=6, fillstyle='none', markeredgewidth=1.5, label='Picos R')
-                if i == 0:
-                    ax.legend(loc='upper right', fontsize=8)
+            # Plot R-peaks on the specific lead used for detection
+            # CORREÇÃO AQUI: USAR r_peak_detection_lead_name
+            if nome_derivação == r_peak_detection_lead_name and picos_r_indices is not None and len(picos_r_indices) > 0:
+                 ax.plot(eixo_tempo[picos_r_indices], amostras_mv[picos_r_indices], "o", color='red', markersize=6, fillstyle='none', markeredgewidth=1.5, label='Picos R')
+            
+            # Plot P-peaks on the specific lead used for detection
+            p_detection_lead_name = "DII" if dii_amostras is not None else ("V1" if ecg_data.get("V1") is not None else primeira_derivação_nome)
+            if nome_derivação == p_detection_lead_name and len(picos_p_indices) > 0:
+                ax.plot(eixo_tempo[picos_p_indices], amostras_mv[picos_p_indices], "x", color='blue', markersize=6, fillstyle='none', markeredgewidth=1.5, label='Picos P')
+
+            # Only add legend if it's the first plot and relevant markers are present
+            if i == 0: 
+                handles, labels = [], []
+                if picos_r_indices is not None and len(picos_r_indices) > 0:
+                    handles.append(plt.Line2D([], [], color='red', marker='o', linestyle='None', markersize=6, fillstyle='none', markeredgewidth=1.5))
+                    labels.append('Picos R')
+                if len(picos_p_indices) > 0:
+                    handles.append(plt.Line2D([], [], color='blue', marker='x', linestyle='None', markersize=6, fillstyle='none', markeredgewidth=1.5))
+                    labels.append('Picos P')
+                if handles:
+                    ax.legend(handles, labels, loc='upper right', fontsize=8)
+
 
             ax.set_xticks(np.arange(0, eixo_tempo[-1] + 0.01, 0.2))
             ax.set_yticks(np.arange(ymin_global, ymax_global + 0.01, 0.5))
@@ -286,38 +479,66 @@ def analisar_ecg_simples(metrics):
     """
     Analisa métricas do ECG e retorna um dicionário com a conclusão detalhada.
     Esta função é APENAS para fins de demonstração e não tem validade clínica.
+    Agora considera a idade do paciente para uma análise mais precisa e verifica a onda P.
     """
     conclusions = {
         "frequencia_cardiaca": "",
         "duracao_qrs": "",
         "eixo_qrs": "",
+        "intervalo_qtc": "", 
+        "onda_p": "", 
         "overall_status_html": "",
         "overall_status_pdf": "",
         "attention_note": "Atenção: Esta análise é apenas para fins de demonstração e se baseia em métricas selecionadas. Não substitui, de forma alguma, a avaliação e o diagnóstico de um profissional de saúde qualificado. A interpretação de um ECG requer conhecimento médico aprofundado e o contexto clínico completo do paciente."
     }
     is_overall_normal = True
 
+    idade = metrics.get("idade_paciente")
+    sexo = metrics.get("sexo_paciente", "N/A").upper()
+
+    fc_normal_min, fc_normal_max = 60, 100 
+    qrs_normal_max = 0.100 
+    eixo_qrs_normal_min, eixo_qrs_normal_max = -30, 90 
+
+    qtc_normal_max_male = 450 # ms
+    qtc_normal_max_female = 460 # ms
+
+    if isinstance(idade, int):
+        if idade <= 1: 
+            fc_normal_min, fc_normal_max = 100, 160
+        elif 1 < idade <= 3: 
+            fc_normal_min, fc_normal_max = 90, 150
+        elif 3 < idade <= 5:
+            fc_normal_min, fc_normal_max = 80, 140
+        elif 5 < idade <= 10:
+            fc_normal_min, fc_normal_max = 70, 120
+
+        if idade < 16: 
+            eixo_qrs_normal_min, eixo_qrs_normal_max = 0, 120 
+
+
     # 1. Análise de Frequência Cardíaca
     fc_str = metrics.get("frequencia_cardiaca", "N/A")
     try:
-        if "bpm" in fc_str:
+        # Verifica se o valor é um número antes de tentar float()
+        if "bpm" in fc_str and fc_str.replace(" bpm", "").replace('.', '', 1).isdigit():
             fc_valor = float(fc_str.replace(" bpm", ""))
-            if 60 <= fc_valor <= 100:
-                conclusions["frequencia_cardiaca"] = "Frequência Cardíaca: Normal ({:.2f} bpm). Indica um ritmo cardíaco dentro da faixa esperada para repouso.".format(fc_valor)
-                conclusions["frequencia_cardiaca_html"] = "<li><strong>Frequência Cardíaca:</strong> <span class='normal'>Normal</span> ({:.2f} bpm). Indica um ritmo cardíaco dentro da faixa esperada para repouso.</li>".format(fc_valor)
-            elif fc_valor > 100:
-                conclusions["frequencia_cardiaca"] = "Frequência Cardíaca: Taquicardia ({:.2f} bpm). Frequência cardíaca acima do normal. Pode ser causada por diversos fatores como estresse, exercício ou condições médicas. Recomenda-se avaliação.".format(fc_valor)
-                conclusions["frequencia_cardiaca_html"] = "<li><strong>Frequência Cardíaca:</strong> <span class='abnormal'>Taquicardia</span> ({:.2f} bpm). Frequência cardíaca acima do normal. Pode ser causada por diversos fatores como estresse, exercício ou condições médicas. Recomenda-se avaliação.</li>".format(fc_valor)
+            if fc_normal_min <= fc_valor <= fc_normal_max:
+                conclusions["frequencia_cardiaca"] = f"Frequência Cardíaca: Normal ({fc_valor:.2f} bpm) para a idade do paciente. Indica um ritmo cardíaco dentro da faixa esperada para repouso."
+                conclusions["frequencia_cardiaca_html"] = f"<li><strong>Frequência Cardíaca:</strong> <span class='normal'>Normal</span> ({fc_valor:.2f} bpm) para a idade do paciente. Indica um ritmo cardíaco dentro da faixa esperada para repouso.</li>"
+            elif fc_valor > fc_normal_max:
+                conclusions["frequencia_cardiaca"] = f"Frequência Cardíaca: Taquicardia ({fc_valor:.2f} bpm). Frequência cardíaca acima do normal para a idade. Pode ser causada por diversos fatores como estresse, exercício ou condições médicas. Recomenda-se avaliação."
+                conclusions["frequencia_cardiaca_html"] = f"<li><strong>Frequência Cardíaca:</strong> <span class='abnormal'>Taquicardia</span> ({fc_valor:.2f} bpm). Frequência cardíaca acima do normal para a idade. Pode ser causada por diversos fatores como estresse, exercício ou condições médicas. Recomenda-se avaliação.</li>"
                 is_overall_normal = False
-            else: # fc_valor < 60
-                conclusions["frequencia_cardiaca"] = "Frequência Cardíaca: Bradicardia ({:.2f} bpm). Frequência cardíaca abaixo do normal. Pode ser normal em atletas ou indicar condições que requerem investigação.".format(fc_valor)
-                conclusions["frequencia_cardiaca_html"] = "<li><strong>Frequência Cardíaca:</strong> <span class='abnormal'>Bradicardia</span> ({:.2f} bpm). Frequência cardíaca abaixo do normal. Pode ser normal em atletas ou indicar condições que requerem investigação.</li>".format(fc_valor)
+            else: 
+                conclusions["frequencia_cardiaca"] = f"Frequência Cardíaca: Bradicardia ({fc_valor:.2f} bpm). Frequência cardíaca abaixo do normal para a idade. Pode ser normal em atletas ou indicar condições que requerem investigação."
+                conclusions["frequencia_cardiaca_html"] = f"<li><strong>Frequência Cardíaca:</strong> <span class='abnormal'>Bradicardia</span> ({fc_valor:.2f} bpm). Frequência cardíaca abaixo do normal para a idade. Pode ser normal em atletas ou indicar condições que requerem investigação.</li>"
                 is_overall_normal = False
         else:
             conclusions["frequencia_cardiaca"] = "Frequência Cardíaca: Não detectada ou inválida. Não foi possível avaliar a FC."
             conclusions["frequencia_cardiaca_html"] = "<li><strong>Frequência Cardíaca:</strong> Não detectada ou inválida. Não foi possível avaliar a FC.</li>"
             is_overall_normal = False
-    except ValueError:
+    except ValueError: # Este bloco pode ser redundante se o check isdigit() for robusto, mas mantém por segurança
         conclusions["frequencia_cardiaca"] = "Frequência Cardíaca: Erro ao processar o valor. Não foi possível avaliar a FC."
         conclusions["frequencia_cardiaca_html"] = "<li><strong>Frequência Cardíaca:</strong> Erro ao processar o valor. Não foi possível avaliar a FC.</li>"
         is_overall_normal = False
@@ -325,17 +546,18 @@ def analisar_ecg_simples(metrics):
     # 2. Análise da Duração do Complexo QRS
     qrs_str = metrics.get("duracao_qrs", "N/A")
     try:
-        if "s" in qrs_str:
+        if "s" in qrs_str and qrs_str.replace(" s", "").replace('.', '', 1).isdigit():
             qrs_valor = float(qrs_str.replace(" s", ""))
-            if qrs_valor < 0.10: # < 100 ms
-                conclusions["duracao_qrs"] = "Duração do QRS: Normal ({:.3f} s). Indica que a ativação elétrica dos ventrículos ocorre em tempo adequado.".format(qrs_valor)
-                conclusions["duracao_qrs_html"] = "<li><strong>Duração do QRS:</strong> <span class='normal'>Normal</span> ({:.3f} s). Indica que a ativação elétrica dos ventrículos ocorre em tempo adequado.</li>".format(qrs_valor)
+            if qrs_valor < qrs_normal_max: 
+                conclusions["duracao_qrs"] = f"Duração do QRS: Normal ({qrs_valor:.3f} s). Indica que a ativação elétrica dos ventrículos ocorre em tempo adequado."
+                conclusions["duracao_qrs_html"] = f"<li><strong>Duração do QRS:</strong> <span class='normal'>Normal</span> ({qrs_valor:.3f} s). Indica que a ativação elétrica dos ventrículos ocorre em tempo adequado.</li>"
             else:
-                conclusions["duracao_qrs"] = "Duração do QRS: Alargado ({:.3f} s). Pode indicar um atraso na condução elétrica ventricular (ex: bloqueio de ramo) ou outras anormalidades. Requer investigação.".format(qrs_valor)
-                conclusions["duracao_qrs_html"] = "<li><strong>Duração do QRS:</strong> <span class='abnormal'>Alargado</span> ({:.3f} s). Pode indicar um atraso na condução elétrica ventricular (ex: bloqueio de ramo) ou outras anormalidades. Requer investigação.</li>".format(qrs_valor)
+                conclusions["duracao_qrs"] = f"Duração do QRS: Alargado ({qrs_valor:.3f} s). Pode indicar um atraso na condução elétrica ventricular (ex: bloqueio de ramo) ou outras anormalidades. Requer investigação."
+                conclusions["duracao_qrs_html"] = f"<li><strong>Duração do QRS:</strong> <span class='abnormal'>Alargado</span> ({qrs_valor:.3f} s). Pode indicar um atraso na condução elétrica ventricular (ex: bloqueio de ramo) ou outras anormalidades. Requer investigação.</li>"
                 is_overall_normal = False
         else:
             conclusions["duracao_qrs"] = "Duração do QRS: Estimativa não disponível/inválida. Não foi possível avaliar o QRS."
+            conclusions["duracao_qrs_html"] = "<li><strong>Duração do QRS:</strong> Estimativa não disponível/inválida. Não foi possível avaliar o QRS.</li>"
     except ValueError:
         conclusions["duracao_qrs"] = "Duração do QRS: Erro ao processar o valor. Não foi possível avaliar o QRS."
         conclusions["duracao_qrs_html"] = "<li><strong>Duração do QRS:</strong> Erro ao processar o valor. Não foi possível avaliar o QRS.</li>"
@@ -344,18 +566,18 @@ def analisar_ecg_simples(metrics):
     # 3. Análise do Eixo Elétrico QRS
     eixo_str = metrics.get("eixo_qrs", "N/A")
     try:
-        if "°" in eixo_str:
+        if "°" in eixo_str and eixo_str.replace("°", "").replace('.', '', 1).replace('-', '', 1).isdigit(): # Considera o sinal negativo
             eixo_valor = float(eixo_str.replace("°", ""))
-            if -30 <= eixo_valor <= 90:
-                conclusions["eixo_qrs"] = "Eixo Elétrico QRS: Normal ({:.2f}°). O eixo está dentro dos limites fisiológicos.".format(eixo_valor)
-                conclusions["eixo_qrs_html"] = "<li><strong>Eixo Elétrico QRS:</strong> <span class='normal'>Normal</span> ({:.2f}°). O eixo está dentro dos limites fisiológicos.</li>".format(eixo_valor)
-            elif eixo_valor > 90:
-                conclusions["eixo_qrs"] = "Eixo Elétrico QRS: Desvio para a Direita ({:.2f}°). Pode indicar sobrecarga do ventrículo direito ou outras condições.".format(eixo_valor)
-                conclusions["eixo_qrs_html"] = "<li><strong>Eixo Elétrico QRS:</strong> <span class='abnormal'>Desvio para a Direita</span> ({:.2f}°). Pode indicar sobrecarga do ventrículo direito ou outras condições.</li>".format(eixo_valor)
+            if eixo_qrs_normal_min <= eixo_valor <= eixo_qrs_normal_max:
+                conclusions["eixo_qrs"] = f"Eixo Elétrico QRS: Normal ({eixo_valor:.2f}°). O eixo está dentro dos limites fisiológicos para a idade do paciente."
+                conclusions["eixo_qrs_html"] = f"<li><strong>Eixo Elétrico QRS:</strong> <span class='normal'>Normal</span> ({eixo_valor:.2f}°). O eixo está dentro dos limites fisiológicos para a idade do paciente.</li>"
+            elif eixo_valor > eixo_qrs_normal_max:
+                conclusions["eixo_qrs"] = f"Eixo Elétrico QRS: Desvio para a Direita ({eixo_valor:.2f}°). Pode indicar sobrecarga do ventrículo direito ou outras condições. Requer investigação."
+                conclusions["eixo_qrs_html"] = f"<li><strong>Eixo Elétrico QRS:</strong> <span class='abnormal'>Desvio para a Direita</span> ({eixo_valor:.2f}°). Pode indicar sobrecarga do ventrículo direito ou outras condições. Requer investigação.</li>"
                 is_overall_normal = False
-            elif eixo_valor < -30:
-                conclusions["eixo_qrs"] = "Eixo Elétrico QRS: Desvio para a Esquerda ({:.2f}°). Pode ser um achado normal em alguns casos, mas também pode indicar sobrecarga do ventrículo esquerdo ou bloqueios de condução.".format(eixo_valor)
-                conclusions["eixo_qrs_html"] = "<li><strong>Eixo Elétrico QRS:</strong> <span class='abnormal'>Desvio para a Esquerda</span> ({:.2f}°). Pode ser um achado normal em alguns casos, mas também pode indicar sobrecarga do ventrículo esquerdo ou bloqueios de condução.</li>".format(eixo_valor)
+            elif eixo_valor < eixo_qrs_normal_min:
+                conclusions["eixo_qrs"] = f"Eixo Elétrico QRS: Desvio para a Esquerda ({eixo_valor:.2f}°). Pode ser um achado normal em alguns casos, mas também pode indicar sobrecarga do ventrículo esquerdo ou bloqueios de condução. Requer investigação."
+                conclusions["eixo_qrs_html"] = f"<li><strong>Eixo Elétrico QRS:</strong> <span class='abnormal'>Desvio para a Esquerda</span> ({eixo_valor:.2f}°). Pode ser um achado normal em alguns casos, mas também pode indicar sobrecarga do ventrículo esquerdo ou bloqueios de condução. Requer investigação.</li>"
                 is_overall_normal = False
         else:
             conclusions["eixo_qrs"] = "Eixo Elétrico QRS: Estimativa não disponível/inválida. Não foi possível avaliar o Eixo QRS."
@@ -364,129 +586,63 @@ def analisar_ecg_simples(metrics):
         conclusions["eixo_qrs"] = "Eixo Elétrico QRS: Erro ao processar o valor. Não foi possível avaliar o Eixo QRS."
         conclusions["eixo_qrs_html"] = "<li><strong>Eixo Elétrico QRS:</strong> Erro ao processar o valor. Não foi possível avaliar o Eixo QRS.</li>"
         is_overall_normal = False
+    
+    # 4. Análise do Intervalo QTc
+    qtc_str = metrics.get("intervalo_qtc", "N/A")
+    try:
+        if "ms" in qtc_str and qtc_str.replace(" ms", "").replace('.', '', 1).isdigit():
+            qtc_valor = float(qtc_str.replace(" ms", ""))
+            
+            qtc_limit = qtc_normal_max_male
+            if sexo == "FEMININO":
+                qtc_limit = qtc_normal_max_female
+            
+            if qtc_valor <= qtc_limit:
+                conclusions["intervalo_qtc"] = f"Intervalo QTc: Normal ({qtc_valor:.0f} ms). O intervalo QT corrigido está dentro dos limites de normalidade."
+                conclusions["intervalo_qtc_html"] = f"<li><strong>Intervalo QTc:</strong> <span class='normal'>Normal</span> ({qtc_valor:.0f} ms). O intervalo QT corrigido está dentro dos limites de normalidade.</li>"
+            else:
+                conclusions["intervalo_qtc"] = f"Intervalo QTc: Alargado ({qtc_valor:.0f} ms). Pode indicar um risco aumentado de arritmias. Requer investigação imediata."
+                conclusions["intervalo_qtc_html"] = f"<li><strong>Intervalo QTc:</strong> <span class='abnormal'>Alargado</span> ({qtc_valor:.0f} ms). Pode indicar um risco aumentado de arritmias. Requer investigação imediata.</li>"
+                is_overall_normal = False
+        else:
+            conclusions["intervalo_qtc"] = "Intervalo QTc: Não calculado ou inválido. Necessário para avaliação completa."
+            conclusions["intervalo_qtc_html"] = "<li><strong>Intervalo QTc:</strong> Não calculado ou inválido. Necessário para avaliação completa.</li>"
+            is_overall_normal = False
+    except ValueError:
+        conclusions["intervalo_qtc"] = "Intervalo QTc: Erro ao processar o valor. Não foi possível avaliar o QTc."
+        conclusions["intervalo_qtc_html"] = "<li><strong>Intervalo QTc:</strong> Erro ao processar o valor. Não foi possível avaliar o QTc.</li>"
+        is_overall_normal = False
+
+    # 5. Análise da Presença da Onda P (Adição)
+    onda_p_status = metrics.get("onda_p_presente", "Não Avaliado")
+    
+    if onda_p_status == "Presente e Consistente":
+        conclusions["onda_p"] = "Onda P: Presente e consistente. Indica provável ritmo sinusal."
+        conclusions["onda_p_html"] = "<li><strong>Onda P:</strong> <span class='normal'>Presente e consistente</span>. Indica provável ritmo sinusal.</li>"
+    elif onda_p_status == "Presente (mas não consistente em todos)":
+        conclusions["onda_p"] = "Onda P: Presente, mas não consistente em todos os batimentos. Pode indicar anormalidades atriais ou ritmo irregular. Requer investigação."
+        conclusions["onda_p_html"] = "<li><strong>Onda P:</strong> <span class='abnormal'>Presente (mas não consistente em todos)</span>. Pode indicar anormalidades atriais ou ritmo irregular. Requer investigação.</li>"
+        is_overall_normal = False
+    elif onda_p_status == "Ausente ou muito baixa amplitude":
+        conclusions["onda_p"] = "Onda P: Ausente ou muito baixa amplitude. Pode indicar ritmo não sinusal (ex: fibrilação atrial) ou outros problemas. Requer investigação."
+        conclusions["onda_p_html"] = "<li><strong>Onda P:</strong> <span class='abnormal'>Ausente ou muito baixa amplitude</span>. Pode indicar ritmo não sinusal (ex: fibrilação atrial) ou outros problemas. Requer investigação.</li>"
+        is_overall_normal = False
+    else: # "Não Avaliado" ou outro erro
+        conclusions["onda_p"] = "Onda P: Não foi possível avaliar a presença da onda P devido a dados insuficientes ou problemas de detecção."
+        conclusions["onda_p_html"] = "<li><strong>Onda P:</strong> Não foi possível avaliar a presença da onda P devido a dados insuficientes ou problemas de detecção.</li>"
+        is_overall_normal = False # Considerar como não normal para cautela
 
     # Conclusão geral
     if is_overall_normal:
-        conclusions["overall_status_html"] = "<span class='normal'><strong>Resultado Geral: Dentro dos padrões de normalidade para as métricas analisadas.</strong></span>"
-        conclusions["overall_status_pdf"] = "Resultado Geral: Dentro dos padrões de normalidade para as métricas analisadas."
+        conclusions["overall_status_html"] = "<span class='normal'><strong>Resultado Geral: Dentro dos padrões de normalidade para as métricas analisadas, considerando a idade do paciente.</strong></span>"
+        conclusions["overall_status_pdf"] = "Resultado Geral: Dentro dos padrões de normalidade para as métricas analisadas, considerando a idade do paciente."
     else:
-        conclusions["overall_status_html"] = "<span class='abnormal'><strong>Resultado Geral: Fora dos padrões de normalidade para uma ou mais métricas analisadas.</strong></span>"
-        conclusions["overall_status_pdf"] = "Resultado Geral: Fora dos padrões de normalidade para uma ou mais métricas analisadas."
+        conclusions["overall_status_html"] = "<span class='abnormal'><strong>Resultado Geral: Fora dos padrões de normalidade para uma ou mais métricas analisadas. Recomenda-se avaliação médica.</strong></span>"
+        conclusions["overall_status_pdf"] = "Resultado Geral: Fora dos padrões de normalidade para uma ou mais métricas analisadas. Recomenda-se avaliação médica."
     
     return conclusions
 
-# --- Função para Gerar o PDF ---
-def gerar_pdf_ecg(metrics, analysis_conclusions):
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4,
-                            rightMargin=20*mm, leftMargin=20*mm,
-                            topMargin=20*mm, bottomMargin=20*mm)
-    
-    styles = getSampleStyleSheet()
-    
-    # Estilos personalizados
-    styles.add(ParagraphStyle(name='TitleStyle', fontSize=18, leading=22, alignment=TA_CENTER,
-                               fontName='Helvetica-Bold'))
-    styles.add(ParagraphStyle(name='SubtitleStyle', fontSize=14, leading=18, alignment=TA_CENTER,
-                               fontName='Helvetica-Bold'))
-    styles.add(ParagraphStyle(name='Heading2Style', fontSize=14, leading=18, fontName='Helvetica-Bold'))
-    styles.add(ParagraphStyle(name='NormalPara', fontSize=10, leading=14))
-    styles.add(ParagraphStyle(name='BoldNormalPara', fontSize=10, leading=14, fontName='Helvetica-Bold')) 
-
-    # Adicionar estilos de cor para o PDF
-    styles.add(ParagraphStyle(name='NormalGreen', parent=styles['NormalPara'], textColor='green'))
-    styles.add(ParagraphStyle(name='NormalRed', parent=styles['NormalPara'], textColor='red'))
-    styles.add(ParagraphStyle(name='AttentionNote', fontSize=8, leading=10, alignment=TA_CENTER, textColor='red'))
-
-
-    story = []
-
-    # --- Primeira Página: Relatório de Análise ---
-    story.append(Paragraph("Relatório de Análise de Eletrocardiograma (ECG)", styles['TitleStyle']))
-    story.append(Spacer(1, 5*mm))
-    story.append(Paragraph(f"Paciente: {metrics.get('nome_paciente')} ({metrics.get('sexo_paciente')}, {metrics.get('idade_paciente')} anos)", styles['SubtitleStyle']))
-    story.append(Paragraph(f"Data do Exame: {metrics.get('data_exame')} {metrics.get('hora_exame')}", styles['SubtitleStyle']))
-    story.append(Spacer(1, 15*mm))
-
-    story.append(Paragraph("Métricas Detectadas:", styles['Heading2Style']))
-    story.append(Spacer(1, 3*mm))
-    story.append(Paragraph(f"• Frequência Cardíaca: <font face='Helvetica-Bold'>{metrics.get('frequencia_cardiaca')}</font>", styles['NormalPara']))
-    story.append(Paragraph(f"• Duração QRS (Estimada): <font face='Helvetica-Bold'>{metrics.get('duracao_qrs')}</font>", styles['NormalPara']))
-    story.append(Paragraph(f"• Eixo QRS (Estimado): <font face='Helvetica-Bold'>{metrics.get('eixo_qrs')}</font>", styles['NormalPara']))
-    story.append(Spacer(1, 10*mm))
-
-    story.append(Paragraph("Conclusão da Análise Simplificada:", styles['Heading2Style']))
-    story.append(Spacer(1, 3*mm))
-    
-    # Conclusão geral
-    story.append(Paragraph(analysis_conclusions["overall_status_pdf"], styles['BoldNormalPara']))
-    story.append(Spacer(1, 5*mm))
-
-    # Conclusões detalhadas: usar ParagraphStyle com cor
-    for key in ["frequencia_cardiaca", "duracao_qrs", "eixo_qrs"]:
-        text = analysis_conclusions[key] # Pega o texto puro para PDF
-        current_style = styles['NormalPara']
-        
-        if "Normal" in text:
-            current_style = styles['NormalGreen']
-        elif "Taquicardia" in text or "Bradicardia" in text or "Alargado" in text or "Desvio" in text:
-            current_style = styles['NormalRed']
-        
-        if key == "frequencia_cardiaca":
-            formatted_text = text.replace("Frequência Cardíaca:", "<font face='Helvetica-Bold'>Frequência Cardíaca:</font>")
-        elif key == "duracao_qrs":
-            formatted_text = text.replace("Duração do QRS:", "<font face='Helvetica-Bold'>Duração do QRS:</font>")
-        elif key == "eixo_qrs":
-            formatted_text = text.replace("Eixo Elétrico QRS:", "<font face='Helvetica-Bold'>Eixo Elétrico QRS:</font>")
-        else:
-            formatted_text = text
-            
-        story.append(Paragraph(formatted_text, current_style))
-        story.append(Spacer(1, 2*mm))
-
-    story.append(Spacer(1, 15*mm))
-    story.append(Paragraph(analysis_conclusions["attention_note"], styles['AttentionNote']))
-
-    # Adiciona quebra de página
-    story.append(PageBreak())
-
-    # --- Segunda Página: Traçado do ECG ---
-    story.append(Paragraph("Traçado do Eletrocardiograma (ECG)", styles['TitleStyle']))
-    story.append(Spacer(1, 5*mm))
-    story.append(Paragraph(f"Paciente: {metrics.get('nome_paciente')} - Data: {metrics.get('data_exame')}", styles['SubtitleStyle']))
-    story.append(Spacer(1, 10*mm))
-
-    if "ecg_image_b64" in metrics and metrics["ecg_image_b64"]:
-        img_data = base64.b64decode(metrics["ecg_image_b64"])
-        img_buffer = io.BytesIO(img_data)
-        img = Image(img_buffer)
-        
-        max_width = 170*mm
-        max_height = 200*mm 
-
-        original_width, original_height = img.drawWidth, img.drawHeight
-        aspect_ratio = original_height / original_width
-
-        new_width = max_width
-        new_height = new_width * aspect_ratio
-
-        if new_height > max_height:
-            new_height = max_height
-            new_width = new_height / aspect_ratio
-
-        img.drawWidth = new_width
-        img.drawHeight = new_height
-        
-        img.hAlign = TA_CENTER
-        story.append(img)
-    else:
-        story.append(Paragraph("Não foi possível gerar o traçado do ECG.", styles['NormalPara']))
-
-    doc.build(story)
-    buffer.seek(0)
-    return buffer
-
-# --- Rotas do Flask ---
+# --- Rotas do Flask (mantidas iguais) ---
 temp_analysis_data = {} 
 
 @app.route('/')

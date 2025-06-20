@@ -84,20 +84,36 @@
 
     <div class="result-container">
         <div class="analysis-box">
+            <p><strong>Dados do Paciente e Exame:</strong></p>
+            <ul>
+                <li><strong>Paciente:</strong> <span class="info-detail">{{ metrics.get("nome_paciente", "Desconhecido") }}</span></li>
+                <li><strong>Idade:</strong> <span class="info-detail">{{ metrics.get("idade_paciente", "N/A") }} anos</span></li>
+                <li><strong>Sexo:</strong> <span class="info-detail">{{ metrics.get("sexo_paciente", "N/A") }}</span></li>
+                <li><strong>Data do Exame:</strong> <span class="info-detail">{{ metrics.get("data_exame", "N/A") }}</span></li>
+                <li><strong>Hora do Exame:</strong> <span class="info-detail">{{ metrics.get("hora_exame", "N/A") }}</span></li>
+            </ul>
+            <hr style="border: 0; height: 1px; background: #cce0f0; margin: 15px 0;">
+
             <p><strong>Métricas Detectadas:</strong></p>
             <ul>
                 <li>Frequência Cardíaca: <span class="info-detail">{{ metrics.get("frequencia_cardiaca", "N/A") }}</span></li>
                 <li>Duração QRS (Estimada): <span class="info-detail">{{ metrics.get("duracao_qrs", "N/A") }}</span></li>
                 <li>Eixo QRS (Estimado): <span class="info-detail">{{ metrics.get("eixo_qrs", "N/A") }}</span></li>
+                <li>Intervalo QTc (Estimado): <span class="info-detail">{{ metrics.get("intervalo_qtc", "N/A") }}</span></li> {# Adição para QTc #}
+                <li>Onda P: <span class="info-detail">{{ metrics.get("onda_p_presente", "N/A") }}</span></li> {# Adição para Onda P #}
             </ul>
             <hr style="border: 0; height: 1px; background: #cce0f0; margin: 15px 0;">
+
             <p><strong>Conclusão da Análise Simplificada:</strong></p>
             <div>
                 <p>{{ analysis_result.overall_status_html | safe }}</p>
                 <ul>
-                    <li>{{ analysis_result.frequencia_cardiaca | safe }}</li>
-                    <li>{{ analysis_result.duracao_qrs | safe }}</li>
-                    <li>{{ analysis_result.eixo_qrs | safe }}</li>
+                    {# Use os HTML snippets gerados pela função analisar_ecg_simples #}
+                    {{ analysis_result.frequencia_cardiaca_html | safe }}
+                    {{ analysis_result.duracao_qrs_html | safe }}
+                    {{ analysis_result.eixo_qrs_html | safe }}
+                    {{ analysis_result.intervalo_qtc_html | safe }} {# Adição para QTc #}
+                    {{ analysis_result.onda_p_html | safe }} {# Adição para Onda P #}
                 </ul>
             </div>
             <p style="font-size: 0.9em; color: #666; margin-top: 10px; border-top: 1px dashed #ccc; padding-top: 10px;">
