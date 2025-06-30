@@ -9,6 +9,8 @@ venv/
 .venv/
 *.env
 .vscode/
+temp_results/
+temp_uploads/
 
 # Logs and temporary files
 *.log
